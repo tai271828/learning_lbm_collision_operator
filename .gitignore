@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 *.npz
 *.npy
+*egg-info
 .venv
 
 # Trained model weights
