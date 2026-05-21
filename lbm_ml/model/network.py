@@ -5,7 +5,13 @@ from keras import layers
 from keras.models import Sequential
 from keras.layers import Dense
 
-from lbm_ml.lattice.symmetry import D4Symmetry, D4AntiSymmetry, AlgReconstruction
+from lbm_ml.lattice.symmetry import (
+    D4Symmetry,
+    D4AntiSymmetry,
+    AlgReconstruction,
+    LatticeEquivariantLayer,
+    ConservationCorrection,
+)
 from lbm_ml.model.losses import rmsre
 
 # ---------------------------------------------------------------------------
@@ -124,10 +130,82 @@ def create_resnet_model(
 
 
 # ---------------------------------------------------------------------------
+# Lattice-Equivariant Neural Network (LENN) — Ortali & Gabbana et al. (2025)
+# ---------------------------------------------------------------------------
+
+
+def lenn_core(
+    Q: int = 9,
+    n_hidden_layers: int = 2,
+    n_per_layer: int = 10,
+    activation: str = "relu",
+    ll_activation: str = "linear",
+    bias: bool = True,
+) -> keras.Model:
+    """Stack of lattice-equivariant layers acting on population features.
+
+    The single-channel input population vector x ∈ R^Q is lifted to a
+    multi-channel population feature R^{Q×n_per_layer}, transformed through
+    ``n_hidden_layers`` equivariant layers, and projected back to one channel
+    (R^{Q×1}).  Every layer is equivariant by construction (parameter sharing),
+    so the whole stack is equivariant without any group averaging.
+
+    ``n_per_layer`` plays the role of the channel count C in the paper (cf. the
+    LENN architecture column of Table 1, e.g. [1, 1, 8, 8, 10] in 2D).
+    """
+    inp = keras.Input(shape=(Q,))
+    x = layers.Reshape((Q, 1))(inp)
+
+    # Lift to C channels, then run the equivariant hidden stack.
+    x = LatticeEquivariantLayer(n_per_layer, activation=activation, use_bias=bias, Q=Q)(x)
+    for _ in range(n_hidden_layers):
+        x = LatticeEquivariantLayer(n_per_layer, activation=activation, use_bias=bias, Q=Q)(x)
+
+    # Project back to a single-channel population vector.
+    x = LatticeEquivariantLayer(1, activation=None, use_bias=bias, Q=Q)(x)
+    x = layers.Reshape((Q,))(x)
+
+    # Component-wise final activation: softmax over the Q populations is itself
+    # permutation-equivariant (the normalising sum is permutation-invariant),
+    # so it does not break the lattice equivariance of the network.
+    x = layers.Activation(ll_activation)(x)
+    return keras.Model(inputs=inp, outputs=x)
+
+
+def create_lenn_model(
+    loss: str | Callable = "mape",
+    optimizer: str = "adam",
+    Q: int = 9,
+    n_hidden_layers: int = 2,
+    n_per_layer: int = 10,
+    activation: str = "relu",
+    ll_activation: str = "linear",
+    bias: bool = True,
+) -> keras.Model:
+    """Lattice-equivariant neural network (LENN).
+
+    Architecture:
+      1. Run the equivariant LENN core (lift → equivariant stack → project).
+      2. Enforce mass/momentum conservation with the isotropic, equivariance-
+         preserving ConservationCorrection (Eq. 40-42).
+
+    Unlike the GAVG-based ``d4equivariant``/``resnet`` models, equivariance here
+    is built into each layer's weights, so there is no 8-way lift/average.
+    """
+    inp = keras.Input(shape=(Q,))
+    core = lenn_core(Q, n_hidden_layers, n_per_layer, activation, ll_activation, bias)
+    out = ConservationCorrection()(inp, core(inp))
+    model = keras.Model(inputs=inp, outputs=out)
+    model.compile(loss=loss, optimizer=optimizer)
+    return model
+
+
+# ---------------------------------------------------------------------------
 # Model registry — maps name → factory function
 # ---------------------------------------------------------------------------
 
 MODEL_REGISTRY: dict[str, Callable] = {
     "d4equivariant": create_model,
     "resnet": create_resnet_model,
+    "lenn": create_lenn_model,
 }
